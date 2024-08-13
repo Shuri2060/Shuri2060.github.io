@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8"/>
+    <style>
+        * {
+          font-family: monospace;
+        }
+        #importKey:invalid {
+            border:2px solid #FF0000;
+        }
+        button.buy {
+            border:4px solid #50d2c1;
+            transition: border 0.1s ease-in-out;
+        }
+        button.buy:hover {
+            border:4px solid #97fce4;
+        }
+        button.buy:active {
+            border:4px solid #17453f;
+        }
+    </style>
+    <title>$WASH Sniper | Version CLOWN (v0.0.0 Alpha release)</title>
+    <script crossorigin src="https://unpkg.com/@msgpack/msgpack"></script> <!--https://github.com/msgpack/msgpack-javascript-->
+    <script type="module">
+        import { ethers } from 'https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.min.js' // https://docs.ethers.org/v6/getting-started
+
+        const Hyperliquid = {
+            math: {
+                floatToWeiBig(num, weiDecimals) {
+                    return BigInt(Math.floor(num * 10 ** weiDecimals))
+                },
+                roundWeiDecimals(weiBig, weiDiffBig) {
+                    const pow = 10n ** weiDiffBig
+                    return (weiBig / pow) * pow
+                },
+                roundWeiSigfig(weiBig, sigFig) {
+                    // breaks with negatives
+                    const weiStr = weiBig.toString()
+                    const weiStrRounded = weiStr.slice(0, sigFig) + '0'.repeat(Math.max(0, weiStr.length - sigFig))
+                    return BigInt(weiStrRounded)
+                },
+                weiBigToString(weiBig, weiDecimals) {
+                    // weiDecimals == 0 ? intString : floatString
+                    const weiStr = weiBig.toString()
+                    if (weiDecimals === 0) return weiStr
+                    let floatStr
+                    if (weiStr.length > weiDecimals) {
+                        const dp = weiStr.length - weiDecimals
+                        floatStr = weiStr.slice(0, dp) + '.' + weiStr.slice(dp)
+                    } else {
+                        floatStr = '0.' + weiStr.padStart(weiDecimals, '0')
+                    }
+                    floatStr = floatStr.replace(/0+$/, '')
+                    if (floatStr.slice(-1) == '.') floatStr = floatStr.slice(0, -1)
+                    return floatStr
+                },
+                priceToOrderString(price, szDecimals) { // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size
+                    // sigFig = 5
+                    // wei = 8
+                    // decimals = MAX_DECIMALS - szDecimals // spot = 8, perps = 6
+
+                    const weiDecimals = 8  // spot only
+                    let weiBig = Hyperliquid.math.floatToWeiBig(price, weiDecimals)
+                    weiBig = Hyperliquid.math.roundWeiDecimals(weiBig, BigInt(szDecimals))
+                    weiBig = Hyperliquid.math.roundWeiSigfig(weiBig, 5)
+                    return Hyperliquid.math.weiBigToString(weiBig, weiDecimals)
+                },
+                sizeToOrderString(size, szDecimals) {
+                    // sigFig = inf
+                    // wei = weiDecimals // 5 6 7 8
+                    // decimals = szDecimals // 0 1 2
+
+                    const weiBig = Hyperliquid.math.floatToWeiBig(size, szDecimals)
+                    return Hyperliquid.math.weiBigToString(weiBig, szDecimals)
+                },
+            },
+            actions: {
+                orderLimit({asset, isBid, price, size, isReduce, tif, cloid}) {
+                    return {a: asset, b: isBid, p: price, s: size, r: isReduce, t: {limit: {tif}, ...(cloid !== undefined && {c: cloid})}}
+                },
+                actionOrder({orders}) {
+                    return {type: 'order', orders, grouping: 'na'}
+                },
+                actionSetReferrer({code}) { // Enter Code
+                    return {type: 'setReferrer', code}
+                },
+            },
+            signing: {
+                PHANTOM_DOMAIN: {
+                    name: 'Exchange',
+                    version: '1',
+                    chainId: 1337,
+                    verifyingContract: '0x0000000000000000000000000000000000000000',
+                },
+                AGENT_TYPES: {
+                    Agent: [
+                        {name: 'source', type: 'string'},
+                        {name: 'connectionId', type: 'bytes32'},
+                    ],
+                },
+                actionHash({activePool, action, nonce}) {
+                const msgPackBytes = MessagePack.encode(action)
+                    const data = new Uint8Array(msgPackBytes.length + (activePool === undefined ? 9 : 29))
+                    data.set(msgPackBytes)
+
+                    const view = new DataView(data.buffer)
+                    view.setBigUint64(msgPackBytes.length, BigInt(nonce), false)
+
+                    if (activePool === undefined) {
+                        view.setUint8(msgPackBytes.length + 8, 0)
+                    } else {
+                        view.setUint8(msgPackBytes.length + 8, 1)
+                        data.set(ethers.getBytes(activePool), msgPackBytes.length + 9)
+                    }
+                    return ethers.keccak256(data)
+                },
+                async signInnerAsync({wallet, message}) {
+                    const {r, s, v} = ethers.Signature.from(await wallet.signTypedData(
+                        Hyperliquid.signing.PHANTOM_DOMAIN,
+                        Hyperliquid.signing.AGENT_TYPES,
+                        message,
+                    ))
+                    return {r, s, v}
+                },
+                async signL1ActionAsync({isMainnet, wallet, activePool, action, nonce}) {
+                    return await Hyperliquid.signing.signInnerAsync({
+                        wallet,
+                        message: {
+                            source: isMainnet ? 'a' : 'b',
+                            connectionId: Hyperliquid.signing.actionHash({activePool, action, nonce}),
+                        },
+                    })
+                },
+            },
+            requests: {
+                async payloadExchangeAsync({isMainnet, wallet, subaccount, action, nonce}) {
+                    const signature = await Hyperliquid.signing.signL1ActionAsync({isMainnet, wallet, activePool: subaccount, action, nonce})
+                    return {action, nonce, signature, vaultAddress: subaccount}
+                },
+                wsMsg({id, type, payload}) {
+                    return JSON.stringify({method: 'post', id, request: {type, payload}})
+                },
+                async postAsync({url, endpoint, payload}) {
+                    return await fetch(url + endpoint, {
+                        method: 'POST',
+                        headers: {
+                            Accept: 'application/json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(payload),
+                    }).then(response => {
+                        if (response.ok) {
+                            return response.json()
+                        } else {
+                            throw new Error("HTTP error")
+                        }
+                    })
+                },
+                async postInfoAsync({url, payload}) {
+                    return await Hyperliquid.requests.postAsync({url, endpoint: '/info', payload})
+                },
+                async postExchangeAsync({url, payload}) {
+                    return await Hyperliquid.requests.postAsync({url, endpoint: '/exchange', payload})
+                },
+            }
+        }
+
+        const ClownSniper = {
+            import: {
+                keyToWallet(key) {
+                    // return: undefined is ignore, null is error
+                    if (key === null || key === '') return
+                    try {
+                        return new ethers.Wallet(key)
+                    } catch {
+                        return null
+                    }
+                },
+                readWalletFromKeyField() {
+                    return ClownSniper.import.keyToWallet(keyField.value)
+                },
+                readWalletFromLocalStorage() {
+                    return ClownSniper.import.keyToWallet(localStorage.getItem('apiKey'))
+                },
+                loadToWindow(apiWallet) {
+                    keyField.value = ''
+
+                    if (apiWallet === undefined) return
+                    if (apiWallet === null) return ClownSniper.import.delete(true)
+
+                    ClownSniper.import.apiWallet = apiWallet
+                    localStorage.setItem('apiKey', ClownSniper.import.apiWallet.privateKey)
+                    addressField.value = ClownSniper.import.apiWallet.address
+                },
+                loadLocal() {
+                    ClownSniper.import.loadToWindow(ClownSniper.import.readWalletFromLocalStorage())
+                },
+                saveLocal() {
+                    ClownSniper.import.loadToWindow(ClownSniper.import.readWalletFromKeyField())
+                },
+                delete(err = false) {
+                    ClownSniper.import.apiWallet = null
+                    localStorage.removeItem('apiKey')
+                    addressField.value = err ? 'bad key; no key imported' : 'no key imported'
+                },
+                apiWallet: null,
+            },
+            testTrade: {
+                async midAsync(isMainnet, coin) {
+                    const spotMetaAndAssetCtxs = await Hyperliquid.requests.postInfoAsync({url: URLS[isMainnet], payload: {type: 'spotMetaAndAssetCtxs'}})
+                    return parseFloat(spotMetaAndAssetCtxs[1][coin].midPx)
+                },
+                async buyAsync(token) {
+                    const wallet = ClownSniper.import.apiWallet
+                    if (wallet !== null) {
+                        try {
+                            const isMainnet = window.IS_MAINNET
+                            const coin = TOKENS[token].coin
+                            const szDecimals = TOKENS[token].szDecimals
+
+                            var mid = await ClownSniper.testTrade.midAsync(isMainnet, coin)
+                            if (coin === 25) mid = Math.max(mid, 0.001)
+                            
+                            const price = Hyperliquid.math.priceToOrderString(mid * 1.45, szDecimals)
+                            const size = Hyperliquid.math.sizeToOrderString(15 / price, szDecimals)
+                            const nonce = Date.now()
+                            console.log(price, size, nonce)
+
+                            const wallet = ClownSniper.import.apiWallet
+                            const action = Hyperliquid.actions.actionOrder({orders: [Hyperliquid.actions.orderLimit({asset: 10000 + coin, isBid: true, price, size, isReduce: false, tif: 'Ioc'})]})
+                            console.log(action)
+                            const payload = await Hyperliquid.requests.payloadExchangeAsync({isMainnet, wallet, action, nonce})
+                            console.log(payload)
+                            const data = await Hyperliquid.requests.postExchangeAsync({url: URLS[isMainnet], payload})
+                            tradeOutputTextarea.value = `${JSON.stringify(data)}\n===\n` + tradeOutputTextarea.value
+                        } catch(e) {
+                            console.log(e)
+                            tradeOutputTextarea.value = `${e}\n===\n` + tradeOutputTextarea.value
+                        }
+                    } else {
+                        tradeOutputTextarea.value += 'No API key imported\n===\n'
+                    }
+                },
+            },
+            sniper: {
+                async addOrders() {
+                    const priceF = parseFloat(maxPriceField.value)
+                    const countF = parseFloat(numOrdersField.value)
+                    maxPriceField.value = ''
+
+                    if (isNaN(priceF) || isNaN(countF)) {
+                        return // add error
+                    }
+                    try {
+                        const action = Hyperliquid.actions.actionOrder({orders: [
+                            Hyperliquid.actions.orderLimit({
+                                asset: 10054,
+                                isBid: true,
+                                price: Hyperliquid.math.priceToOrderString(priceF, 2),
+                                size: Hyperliquid.math.sizeToOrderString(69420, 2),
+                                isReduce: false,
+                                tif: 'Ioc',
+                            })
+                        ]})
+                        for (let i = 0; i < countF; i++) {
+                            const payload = await Hyperliquid.requests.payloadExchangeAsync({
+                                isMainnet: window.IS_MAINNET,
+                                wallet: ClownSniper.import.apiWallet,
+                                action,
+                                nonce: Date.now() + i,
+                            })
+                            const m = Hyperliquid.requests.wsMsg({id: idCounter++, type: 'action', payload})
+                            ClownSniper.sniper.orders.push(m)
+                        }
+                    } catch(e) {
+                        console.log(e)
+                    }
+                    ordersOutputTextarea.value = `You have ${ClownSniper.sniper.orders.length} orders queued`
+                },
+                deleteAllOrders() {
+                    ClownSniper.sniper.orders = []
+                    ordersOutputTextarea.value = 'You have 0 orders queued'
+                },
+                
+                snipe(orders) {
+                    const ws = new WebSocket(URIS[window.IS_MAINNET])
+                    ws.addEventListener('message', console.log)
+                    ws.addEventListener('open', () => {
+                        let i = 0
+                        const intervalId = setInterval(function() {
+                            if (i >= orders.length) {
+                                window.clearInterval(intervalId)
+                                return
+                            }
+                            ws.send(orders[i++])
+                        }, 40)
+                    })
+                },
+                snipeExecute() {
+                    const orders = ClownSniper.sniper.orders
+                    if (orders.length > 0) {
+                        ClownSniper.sniper.deleteAllOrders()
+                        ClownSniper.sniper.snipe(orders)
+                    }
+                },
+                snipeAt() {
+                    const orders = ClownSniper.sniper.orders
+                    if (orders.length > 0) {
+                        document.querySelectorAll('button').forEach(elem => elem.disabled = true)
+                        ClownSniper.sniper.deleteAllOrders()
+
+                        const snipeT = Date.parse(`2024-08-13T${timeInput.value}.000Z`)
+                        const intervalId = setInterval(function() {
+                            const diff = snipeT - Date.now()
+                            if (diff <= 0) {
+                                window.clearInterval(intervalId)
+                                ClownSniper.sniper.snipe(orders)
+                                return
+                            }
+                            countdownTextarea.value = `This will execute ${orders.length} orders after ${Math.floor(diff / 1000)} seconds`
+                        }, 1000)
+                    }
+                },
+                orders: [],
+            },
+            expertMode() {
+                const tutorials = document.getElementsByClassName('tutorial')
+                const display = expertModeOffRadio.checked ? '' : 'none'
+                localStorage.setItem('tutorial', display)
+
+                for (let tutorial of tutorials) tutorial.style.display = display
+            },
+        }
+
+        var idCounter = 0
+        window.IS_MAINNET = true
+
+        const URLS = {
+            false: 'https://api.hyperliquid-testnet.xyz',
+            true: 'https://api.hyperliquid.xyz',
+        }
+        const URIS = {
+            false: 'wss://api.hyperliquid-testnet.xyz/ws',
+            true: 'wss://api.hyperliquid.xyz/ws',
+        }
+
+        const TOKENS = {
+            XULIAN: {coin: 12, szDecimals: 0, weiDecimals: 5},
+            ILIENS: {coin: 14, szDecimals: 0, weiDecimals: 5},
+            BIGBEN: {coin: 25, szDecimals: 2, weiDecimals: 8},
+        }
+
+        const keyField = document.getElementById('importKey')
+        const addressField = document.getElementById('importedAddress')
+        addressField.value = 'no key imported'
+
+        const tradeOutputTextarea = document.getElementById('tradeOutput')
+        const ordersOutputTextarea = document.getElementById('ordersOutput')
+
+        ClownSniper.import.loadLocal()
+
+        const maxPriceField = document.getElementById('maxPrice')
+        const numOrdersField = document.getElementById('numOrders')
+
+        const timeInput = document.getElementById('timeInput')
+        const countdownTextarea = document.getElementById('countdown')
+
+        const expertModeOffRadio = document.getElementById('expertModeOff')
+        const expertModeOnRadio = document.getElementById('expertModeOn')
+
+        window.tradeOutputTextarea = tradeOutputTextarea
+        window.timeInput = timeInput
+
+        window.ethers = ethers
+        window.Hyperliquid = Hyperliquid
+        window.ClownSniper = ClownSniper
+
+        window.URLS = URLS
+        window.URIS = URIS
+
+        if (localStorage.getItem('tutorial') === 'none') {
+            expertModeOnRadio.checked = true
+            ClownSniper.expertMode()
+        }
+    </script>
+</head>
+<body>
+    <h1>$WASH Sniper | Version CLOWN (v0.0.0 Alpha release)</h1>
+    <p class="tutorial">
+        <b>DISCLAIMER</b>: This is an Alpha version. Use this page and your funds at your own risk. No compensations can be made if there are any errors.<br>
+        <br>
+        A simple stupid sniper written in raw HTML & vanilla JS. This is a static web page; there is no server or database.<br>
+        You are in full custody of your funds. <b>This is a fully trustless sniper.</b><br>
+        This page makes network connections to ONLY <a href="https://app.hyperliquid.xyz">Hyperliquid</a> using their <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api">API</a>.<br>
+        All sniper logic runs locally on your browser, using Javascript. Minimal computing power needed.<br>
+        The sniper relies on your internet connection. Latency should have little impact on efficiency.<br>
+        <br>
+        This page was written for Chrome on PC. It may display incorrectly on other browsers/devices.
+    </p>
+
+    <h2>Step 1: Import API wallet Private Key</h2>
+    <div class="tutorial">
+        <ol start="0">
+            <li>Connect to <a href="https://app.hyperliquid.xyz">Hyperliquid</a> with your Trading Wallet. (Recommend use new wallet)</li>
+            <li>Go to Hyperliquid <a href="https://app.hyperliquid.xyz/API">API page</a> (can be found under <a href="https://app.hyperliquid.xyz">Hyperliquid</a> > More > API)</li>
+            <li>Generate & Authorize an API wallet address</li>
+            <li>Import the API Private Key below</li>
+        </ol>
+        Now you can snipe using the Trading Wallet. You can Deposit/Transfer Spot USDC to the Trading Wallet via Hyperliquid's frontend.<br>
+
+        <h3>WARNING:</h3>
+        Sniper will attempt to use <b>ALL</b> Spot USDC to snipe. Only deposit as much as you're willing to use. Perp USDC will not be touched.<br>
+        <br>
+        An API Private Key gives full access (except transfers/withdrawals) to your Trading Wallet.<br>
+        You can revoke access any time using the Remove button on the <a href="https://app.hyperliquid.xyz/API">API page</a>.<br>
+        <br>
+        Keep the Private Key safe. Do not use the the API wallet for anything else.<br>
+        Do not send funds to the API wallet address (if done by mistake, this is reversible).<br>
+        <br>        
+        <b>NOT recommended:</b><br>
+        <small><small>
+            You can input your Trading Wallet Private Key below.<br>
+            Remember anyone with your Private Key has full access to your wallet that you cannot revoke.
+        </small></small><br>
+    </div>
+
+    <label for="importKey">API Private Key:</label>
+    <input id="importKey" type="password" size="66" minlength="66" maxlength="66" required><br>
+    <br>
+    <button onclick="ClownSniper.import.saveLocal()"><b>Import</b> (persists in Local Storage)</button>
+    <br>
+    <br>
+    <label for="importedAddress">Imported API Address:</label>
+    <input id="importedAddress" type="text" size="42" minlength="42" maxlength="42" disabled>
+    <button onclick="navigator.clipboard.writeText(ClownSniper.import.address)">Copy</button>
+    <br>
+    <br>
+    <button onclick="ClownSniper.import.delete()"><b>Delete</b> Imported API Private Key</button>
+    <div class="tutorial">
+        <h3>Test Imported Key (optional):</h3>
+        <p>
+            You can test the import works by placing a trade
+        </p>
+        <button class="buy" onclick="ClownSniper.testTrade.buyAsync('XULIAN')">
+            Buy ~$10 of <b>$XULIAN</b><br>
+            <br>
+            <img src="https://cdn.discordapp.com/attachments/539909799899430923/1272573000708919357/XULIAN_icon_160.png?ex=66bb7776&is=66ba25f6&hm=604adf64f2cb3818e59d7bcd0466b690fb26230f6d29b7137f6b36741f0efa60&"><br>
+            🫀🫁🧠<br>
+            <small><small>"Please don't sell your organs"</small></small>
+        </button>
+        <button class="buy" onclick="ClownSniper.testTrade.buyAsync('ILIENS')">
+            Buy ~$10 of <b>$ILIENS</b><br>
+            <br>
+            <img src="https://cdn.discordapp.com/attachments/539909799899430923/1272573015510618215/ILIENS_icon_160.png?ex=66bb777a&is=66ba25fa&hm=f0ec0e1e8c25e08837a1e59df16a1a763a62cdc4768634188fdd2eeea0c99b1f&"><br>
+            👽👾🛸<br>
+            <small><small>"aliens incoming LFG"</small></small>
+        </button>
+        <button class="buy" onclick="ClownSniper.testTrade.buyAsync('BIGBEN')">
+            Buy ~$10 of <b>$BIGBEN</b><br>
+            <br>
+            <img src="https://cdn.discordapp.com/attachments/539909799899430923/1272573027447738488/BIGBEN_icon_160.png?ex=66bb777d&is=66ba25fd&hm=32ba2875a8355bc6b0b7de22b2f8b59faf874d98e5be7b68eb821e91263f3c28&"><br>
+            🕓⌛💻<br>
+            <small><small>TICK TOCK TICK TOCK</small></small>
+        </button><br>
+        <br>
+        <label for="tradeOutput">Trade Result:</label><br>
+        <textarea id="tradeOutput" rows="8" cols= "72" readonly></textarea><br>
+        <button onclick="window.tradeOutputTextarea.value = ''">Clear</button>
+    </div>
+    <h2>Step 2: Configure Sniper</h2>
+    <b>$WASH</b> presale ended at <b>~0.1</b>, so it will launch at this price<br>
+    <div class="tutorial">    
+        <p>
+            <br>
+            Add your sniping orders. Choose the maximum price you're willing to execute them at.<br>
+            <br>
+            Orders cannot execute 20x away from the Mark Price<br>
+            Don't add too many at once, your browser needs to sign all of them. Recommend under 1000 at a time, to avoid a freeze.<br>
+            <h3>WARNING:</h3>
+            Each account has <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits">Rate Limits</a>.<br>
+            An account can only place at most 10000 orders plus extra requests per USDC traded, before it is rate limited.<br>
+            This sniper sends 1500 orders a minute.
+        </p>
+    </div>
+    <br>
+    <label for="maxPrice">Maximum Price</label>
+    <input type="number" id="maxPrice" required><br>
+    <label for="numOrders"># Spam Orders</label>
+    <input type="number" id="numOrders" required value="100"><br>
+    <br>
+    <button onclick="ClownSniper.sniper.addOrders()">Add</button>
+    <button onclick="ClownSniper.sniper.deleteAllOrders()">Delete all</button><br>
+    <br>
+    <label for="ordersOutput">Orders:</label><br>
+    <textarea id="ordersOutput" rows="1" cols= "60" readonly>You have 0 orders queued</textarea><br>
+
+    <h2>Step 3: Execute</h2>
+    <div class="tutorial">
+        This will execute orders at 1500 per minute, and shouldn't exceed Hyperliquid's rate limits<br>
+        <br>
+    </div>
+    <button class="buy" onclick="ClownSniper.sniper.snipeExecute()">
+        <b>EXECUTE</b> orders <b>NOW</b><br>
+        <br>
+        <img src="https://cdn.discordapp.com/attachments/539909799899430923/1272882218578214953/image.png?ex=66bc9771&is=66bb45f1&hm=618b4532c0f0ee77cde4dae0d684dcfa320e04551db5804430fb471978551bf0&"><br>
+    </button><br>
+    <br>
+    <br>
+    <label for="timeInput">Time UTC</label>
+    <input id="timeInput" type="time" step="1" value="17:59:30" required><br>
+    <br>
+    <button class="buy" onclick="ClownSniper.sniper.snipeAt()">
+        <b>EXECUTE</b> orders @ time<br>
+        <br>
+        <img src="https://cdn.discordapp.com/attachments/539909799899430923/1272915083768631367/image.png?ex=66bcb60d&is=66bb648d&hm=2d442ea9d2a317916177dc9ad2fe0ec1df75b627c9e89cfb632bbb0e813c9310&"><br>
+    </button><br><br>
+    <label for="countdown">Countdown:</label><br>
+    <textarea id="countdown" rows="1" cols= "60" readonly>This will execute N/A orders after N/A seconds</textarea><br>
+    <div class="tutorial">
+        <br>
+        To avoid lag, the results of your orders won't be displayed here.<br>
+        Check the Hyperliquid trade history and orders tab to see the results.<br>
+        <br>
+        If you want to cancel execution at any point, close this page.
+    </div>
+
+    <h1>Settings</h1>
+    <input id="expertModeOff" type="radio" name="expertMode" onchange="ClownSniper.expertMode()" checked>
+    <label for="expertModeOff">Show Tutorial / Warnings</label><br>
+    <input id="expertModeOn" type="radio" name="expertMode" onchange="ClownSniper.expertMode()">
+    <label for="expertModeOn">Hide Tutorial / Warnings. You acknowledge you know how the sniper works and have carefully considered all warnings.</label>
+    <h1>About</h1>
+    This sniper can only be used for <b>$WASH</b> and is meant to be a test. That's why its on github pages, and the frontend isn't fancy. I collect no data from this frontend; it only interacts with Hyperliquid.<br>
+    It will be updated so it can be used selectively for future launches depending on feedback and to support other projects.<br>
+    Feel free to give feedback in <a href="https://discord.gg/hyperliquid">Discord</a> / <a href="https://t.me/+SJRiO42rufBmODBk">TG</a>. Very interested to hear about results if any.<br>
+    <br>
+    Since the sniper works locally, I can't enforce fees, or anything like that; it's completely free.<br>
+    But that's fine for me; this sniper is a side project of mine intended for everyone to use. It's not particularly well written, but open source and others can improve on it.<br>
+    This sniper isn't meant to compete with others like $HFUN - they have much more powerful infra running close to HL's servers, rather than some javascript run locally on your own internet. If anything, it's probably a good idea to try and use both to increase your sniping chances.<br>
+    <br>
+    If you want to support me, please support and share the memes I've created on Hyperliquid <b>$XULIAN $ILIENS $BIGBEN</b>, and now <b>$WASH</b>. You can also use my <a href="https://app.hyperliquid.xyz/join/DEPLOY">HL referral</a> / <a href="https://t.me/HypurrFunBot?start=ref_05695f41">TG referral</a>.<br>
+    I will continue making other tools in my free time which I hope will support the memes I've launched by using them as test tokens without directly giving them utility.<br>
+    <br>
+    -Shuri2060
+</body>
+</html>
