@@ -245,38 +245,40 @@
             },
             sniper: {
                 async addOrders() {
-                    const priceF = parseFloat(maxPriceField.value)
-                    const countF = parseFloat(numOrdersField.value)
-                    maxPriceField.value = ''
+                    if (wallet !== null) {
+                        const priceF = parseFloat(maxPriceField.value)
+                        const countF = parseFloat(numOrdersField.value)
+                        maxPriceField.value = ''
 
-                    if (isNaN(priceF) || isNaN(countF)) {
-                        return // add error
-                    }
-                    try {
-                        const action = Hyperliquid.actions.actionOrder({orders: [
-                            Hyperliquid.actions.orderLimit({
-                                asset: 10054,
-                                isBid: true,
-                                price: Hyperliquid.math.priceToOrderString(priceF, 2),
-                                size: Hyperliquid.math.sizeToOrderString(69420, 2),
-                                isReduce: false,
-                                tif: 'Ioc',
-                            })
-                        ]})
-                        for (let i = 0; i < countF; i++) {
-                            const payload = await Hyperliquid.requests.payloadExchangeAsync({
-                                isMainnet: window.IS_MAINNET,
-                                wallet: ClownSniper.import.apiWallet,
-                                action,
-                                nonce: Date.now() + i,
-                            })
-                            const m = Hyperliquid.requests.wsMsg({id: idCounter++, type: 'action', payload})
-                            ClownSniper.sniper.orders.push(m)
+                        if (isNaN(priceF) || isNaN(countF)) {
+                            return // add error
                         }
-                    } catch(e) {
-                        console.log(e)
+                        try {
+                            const action = Hyperliquid.actions.actionOrder({orders: [
+                                Hyperliquid.actions.orderLimit({
+                                    asset: 10054,
+                                    isBid: true,
+                                    price: Hyperliquid.math.priceToOrderString(priceF, 2),
+                                    size: Hyperliquid.math.sizeToOrderString(69420, 2),
+                                    isReduce: false,
+                                    tif: 'Ioc',
+                                })
+                            ]})
+                            for (let i = 0; i < countF; i++) {
+                                const payload = await Hyperliquid.requests.payloadExchangeAsync({
+                                    isMainnet: window.IS_MAINNET,
+                                    wallet: ClownSniper.import.apiWallet,
+                                    action,
+                                    nonce: Date.now() + i,
+                                })
+                                const m = Hyperliquid.requests.wsMsg({id: idCounter++, type: 'action', payload})
+                                ClownSniper.sniper.orders.push(m)
+                            }
+                        } catch(e) {
+                            console.log(e)
+                        }
+                        ordersOutputTextarea.value = `You have ${ClownSniper.sniper.orders.length} orders queued`
                     }
-                    ordersOutputTextarea.value = `You have ${ClownSniper.sniper.orders.length} orders queued`
                 },
                 deleteAllOrders() {
                     ClownSniper.sniper.orders = []
