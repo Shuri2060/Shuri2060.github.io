@@ -245,6 +245,7 @@
             },
             sniper: {
                 async addOrders() {
+                    const wallet = ClownSniper.import.apiWallet
                     if (wallet !== null) {
                         const priceF = parseFloat(maxPriceField.value)
                         const countF = parseFloat(numOrdersField.value)
